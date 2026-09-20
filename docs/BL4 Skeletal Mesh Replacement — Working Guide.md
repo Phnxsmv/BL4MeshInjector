@@ -1,6 +1,6 @@
 # BL4 Skeletal Mesh Replacement — Working Guide
 
-2026-09-19 · @Philip
+2026-09-19 · @Phnx
 
 ## The core principle
 
@@ -82,7 +82,7 @@ What this means in practice:
 - **Blender's PSK export wrote metres** (Z 1.09–1.76), 100× too small. The FBX from Unreal was correct at centimetres.
 - Applying 0.01 on export was right *when Unreal was in the pipeline*. It is wrong now. The pipeline is PSK in, PSK out, **no scaling at either end**.
 
-The builder derives the factor from the FBX, which is authoritative, and applies it automatically — so either scale works. But set the exporter to 100 anyway so the files are correct standalone.
+On route 1 there is nothing to correct: FModel's PSKs are already in centimetres, so the build runs at `--scale 1.0`. On route 2 the builder derives the factor from the FBX, which is authoritative. Either way, set your Blender exporter to 100 so the files are correct standalone.
 
 ### Verifying scale in one line
 
@@ -109,7 +109,7 @@ Import the FModel PSK. It arrives in centimetres and will look huge against the 
 Constraints to respect while modelling:
 
 - **Stay under the vanilla vertex and triangle counts** for every LOD (see Budgets below). You can go under freely; you cannot go over.
-- **Keep the material assignment clean.** Every vertex must belong to exactly one material. A vertex shared between `MI_CH_Upperbody` and `MI_CH_Skin` faces forces a split the builder does not currently perform.
+- **Keep the material assignment clean.** Every vertex must belong to exactly one material — a vertex shared between faces of two materials forces a split the builder does not perform. The number of material slots must also match vanilla, since sections are derived from them.
 - **Keep the skeleton intact.** All 392 bones, same names, same order. The builder maps bone indices straight across and will not remap.
 
 ### 3. Generate LODs
@@ -206,6 +206,21 @@ MaxBoneInfluences i32, flags 22,
 DupVertData (4 + 4n), DupVertIndexData (4 + 8n), flags 4
 ```
 
+There is **one section per material**, in ascending material order. Parts differ: the CorpoHacker upper body has two, the lower body has three. Read the count from vanilla rather than assuming.
+
+`BaseIndex` and `BaseVertexIndex` are cumulative — each section starts where the previous one ended. Index buffers hold **absolute** vertex indices, and a section's `BaseVertexIndex` equals its first index.
+
+Two fields sit inside the 21 otherwise-undecoded bytes that follow `NumTriangles`:
+
+```
+offset  0..3   bRecomputeTangent
+offset  4      RecomputeTangentsVertexMaskChannel (3 = Alpha)
+offset  5..8   bCastShadow
+offset  9..12  bVisibleInRayTracing
+offset 13..16  BaseVertexIndex      <- must be rewritten when the split changes
+offset 17..20  ClothMappingData count
+```
+
 ### LOD payload (same layout in `.ubulk` and inline)
 
 ```
@@ -243,17 +258,31 @@ All pure Python, no dependencies.
 | --- | --- |
 | `bl4mesh.py` | LOD payload codec — parse and re-serialise, byte-exact. Also `vertices()`, `triangles()`, `set_positions()`, `set_triangles()` |
 | `bl4uexp.py` | `.uexp` structure parser. Records the byte offset of every editable field so edits are in-place patches; undecoded bytes are never rewritten |
-| `bl4psk.py` | ActinX PSK reader — points, wedge UVs, faces, materials, weights, skeleton |
-| `fbx.py` | Binary FBX 7.x reader — used only for vertex normals |
-| `bl4build.py` | Builds a LOD payload from PSK geometry + FBX normals: section split, wedge ordering, bone maps, tangent generation, padding |
-| `build_all.py` | Runs the whole build: four LODs, assembles `.uexp` and `.ubulk`, patches the `.uasset` |
-| `verify.py` | Regression test. Round-trips vanilla through both codecs and asserts byte-identical output |
+| `bl4psk.py` | ActorX PSK reader — points, wedge UVs, faces, materials, weights, skeleton, normals |
+| `bl4build.py` | Builds one LOD payload: section split by material, vertex ordering, bone maps, tangent generation, padding |
+| `build_part.py` | The build command. Preflight, four LODs, assembles `.uexp` and `.ubulk`, patches the `.uasset`, postflight |
+| `verify_part.py` | Standalone validator for files already on disk — someone else's build, or a re-check after repacking |
+| `fbx.py` | Binary FBX 7.x reader. Only needed for route 2, where normals come from an FBX |
 
 ### Running a build
 
-Point `build_all.py` at your vanilla triple and your four PSKs plus the FBX, then run it. It reports per-LOD counts against budget, padding applied, payload sizes against vanilla, and the `.uasset` delta.
+```
+python3 build_part.py \
+    --vanilla /path/to/SKPart_CorpoHacker_UpperBody \
+    --psk LOD0.psk LOD1.psk LOD2.psk LOD3.psk \
+    --out ./built
+```
 
-If payload sizes come out identical to vanilla, the `.ubulk` length is unchanged and the data-resource table needs no edit — the simplest case.
+`--vanilla` is a path **without** extension; `.uasset`/`.uexp`/`.ubulk` are appended. `--psk` takes one file per LOD in order. Output files are written to `--out` under the vanilla part's own base name, ready to repack.
+
+Two optional flags:
+
+- `--scale` multiplies source positions. Leave at 1.0 for centimetres; use 100 if your PSKs came out in metres.
+- `--base-vertex-index` is `computed` (default) or `vanilla`. See the pitfall below — the game ignores the field either way, but FModel's preview may only work with `vanilla`.
+
+The build reports per-LOD counts against budget, padding applied, payload sizes against vanilla, and the `.uasset` delta. If payload sizes come out identical to vanilla, the `.ubulk` length is unchanged and the data-resource table needs no edit — the simplest case.
+
+Nothing is part-specific: buffer offsets, budgets, LOD count, which LOD is inline and the section count are all read from the vanilla files, so the same command works on any part.
 
 ### What the builder patches in the `.uasset`
 
@@ -262,9 +291,16 @@ Only two fields, both by the `.uexp` size delta:
 - export 1 `SerialSize`
 - `BulkDataStartOffset` (at `0x110` in the reference part)
 
-### Run `verify.py` after touching the codecs
+### Verification is built in
 
-It proves the format model still holds by round-tripping vanilla byte-for-byte. If that passes, parsing is sound; if it fails, fix that before looking at anything else.
+The build runs checks itself and **writes nothing if any of them fail**:
+
+- **Preflight** round-trips the vanilla payloads through the codec. If vanilla does not come back byte-identical, the format model does not fit that part and the build stops before touching your geometry.
+- **Postflight** validates the assembled bytes in memory: header offsets, payload parsing, sections inside their buffers, `BaseVertexIndex`/`BaseIndex` chaining, and triangle winding against vanilla's convention.
+
+Both gates are fault-tested: reverting the winding flip or the `BaseVertexIndex` patch produces an explicit failure and no output.
+
+`verify_part.py` runs the same structural checks against files already on disk, for anything the build did not produce.
 
 ## Pitfalls, by symptom
 
@@ -304,6 +340,20 @@ Metres vs centimetres. See the scale section.
 
 Exported with a one-bone armature. Fix the root bone properly instead.
 
+### Build fails with an index error in the bone map
+
+`IndexError` inside `bonemap()`. The source mesh has **more material slots than the builder produced sections for**, so some vertices never entered the ordering. Check the material count against vanilla — the lower body has three where the upper body has two. Current builds fail with an explicit message naming both counts instead.
+
+### FModel will not preview, but the game renders fine
+
+Seen on both this project's builds and other people's working mods. Not fully explained.
+
+One contributing factor is `BaseVertexIndex`. Setting it correctly (`--base-vertex-index computed`, the default) stops FModel previewing; leaving vanilla's values (`--base-vertex-index vanilla`) restores the preview for a two-section part. The game ignores the field either way — a build declaring a section running 1,855 vertices past the end of its buffer still renders and customises correctly — so both are safe in-game.
+
+A three-section part did not preview under either setting, so FModel has at least one further issue beyond this field.
+
+**Treat the game as the authority.** FModel's preview is a convenience, not a correctness criterion.
+
 ### General principle
 
 These errors mask each other. "It got worse" often means "it got further" — a crash after a run of silent failures usually means the loader is now reaching code it could not reach before. Work symptom by symptom and re-validate structure after every change.
@@ -312,20 +362,24 @@ These errors mask each other. "It got worse" often means "it got further" — a 
 
 ### Before repacking
 
-Check the built package against vanilla as a control. All of these should hold:
+`build_part.py` runs these automatically and refuses to write if any fail, so in normal use there is nothing to do. They are listed here because they are what "valid" means, and `verify_part.py` checks the same set against files already on disk:
 
 - `sum(export SerialSize) == len(.uexp) - 4`
-- export 0 `SerialOffset == TotalHeaderSize`; export 1 `SerialOffset == TotalHeaderSize + export0 SerialSize`
+- `TotalHeaderSize == len(.uasset)`; each export's `SerialOffset` is the running total from the header
 - `BulkDataStartOffset == TotalHeaderSize + len(.uexp) - 4`
+- data-resource version is 1, and its `SerialSize` entries sum to the `.ubulk` length
 - `.uexp` parses with every byte accounted for
 - each LOD payload parses to exactly its declared size
-- section vertex and triangle sums ≤ buffer counts, and the last section's index range lies inside the buffer
-- data-resource version is 1, and its `SerialSize` entries sum to the `.ubulk` length
+- section vertex and triangle sums ≤ buffer counts; the last section's index range lies inside the buffer
+- `BaseVertexIndex` and `BaseIndex` chain cumulatively through the sections
+- triangle winding falls on the same side as vanilla's convention
 - geometry bounds match vanilla to \~2 decimals
 
 ### Then check visually
 
-FModel first — it is much faster than a game launch. Look for a solid silhouette from outside, sane shading across UV seams, and correct material assignment. Then in-game, confirm tinting and customisation still work, since that is what the whole vanilla-shell approach exists to protect.
+Try FModel first when it works — it is much faster than a game launch. Look for a solid silhouette from outside, sane shading across UV seams, and correct material assignment. But see the pitfall above: a build can be structurally perfect and still not preview, so a missing preview is not by itself a defect.
+
+The real test is in-game: the mesh renders in the menu and the world, deforms correctly under animation, and tinting and customisation still work — that last one being what the whole vanilla-shell approach exists to protect.
 
 ### Known approximations
 
@@ -335,3 +389,7 @@ Two deliberate shortcuts in the current builder, neither of which prevented a wo
 - **Duplicated-vertices buffers are written empty.** These feed recompute-tangents. Vanilla has real data there (11,406 entries for LOD0 section 0), and emptying them is what shrinks the `.uexp` by \~411 KB. Leaving them empty was checked in-game against the vanilla mesh and produced no visible seams, so it is the recommended default. Both vanilla sections have `bRecomputeTangent` set to false, so nothing reads these buffers for this part — populate them only if you enable that flag, work on a cloth section, or a seam actually shows.
 
 Also worth noting: the bounds radius comes out slightly tighter than vanilla (70.71 vs 72.38) because it is the exact bounding sphere of the new geometry. If the mesh culls early at extreme viewing angles, widen it.
+
+### Verified working
+
+Both the CorpoHacker upper body (two sections) and lower body (three sections) build, load, render in the menu and the world, and support tinting and the customisation system. Topology can change freely between iterations provided every LOD stays under its budget.

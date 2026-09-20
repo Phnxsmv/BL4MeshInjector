@@ -27,3 +27,5 @@ This is necessary because a standard Unreal mesh is not a Gearbox custom **Separ
 --out "output"
 
 Run build_part.py on the vanilla assets to inject PSK data into vanilla assets and write modified copies of the vanilla assets into the output folder.
+
+### Detailed technical info can be found in [docs](https://github.com/Phnxsmv/BL4MeshInjector/blob/main/docs/BL4%20Skeletal%20Mesh%20Replacement%20%E2%80%94%20Working%20Guide.md)

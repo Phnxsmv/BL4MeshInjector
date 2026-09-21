@@ -1,7 +1,4 @@
 # BL4 Skeletal Mesh Replacement — Working Guide
-
-2026-09-19 · @Phnx
-
 ## The core principle
 
 **Start from the vanilla cooked part and replace only the geometry inside it. Never cook your own asset and try to make it pass as a Gestalt part.**

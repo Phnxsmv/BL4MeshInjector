@@ -18,21 +18,13 @@ Usage
 --out is a directory; the three files are written there under the same
       base name as the vanilla part, ready to repack.
 
---base-vertex-index, choices=('computed', 'vanilla'), default='computed'
-                    computed (default) sets each section's BaseVertexIndex to match this
-                    build's section boundaries, which is what the format specifies.
-                    vanilla leaves the original values in place; the game ignores this
-                    field either way, but FModel's preview may only work with vanilla.
---scale, type=float, default=1.0
-                    multiply source positions (1.0 for centimetres, 100 if exported in metres).
-
 Everything else - buffer offsets, budgets, LOD count, which LOD is inline -
 is read from the vanilla files, so this works on any part.
 """
 import argparse, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find the bl4* modules next to this script
-from modules import bl4psk, bl4mesh, bl4uexp, bl4build
+import bl4psk, bl4mesh, bl4uexp, bl4build
 
 # Offsets into the .uasset package summary. These are stable for BL4 packages.
 OFF_TOTAL_HEADER_SIZE = 0x1c
@@ -111,7 +103,44 @@ def find_extras_start(uexp, export_data_start, export_data_end):
 OFF_BASE_VERTEX_IN_FLAGS_A = 13
 
 
-def section_bytes(uexp, vanilla_section, new, patch_base_vertex=True):
+def bone_parents(uexp, M):
+    """Parent index per bone, from the reference skeleton."""
+    out = []
+    for i in range(M['BoneCount']):
+        out.append(struct.unpack_from('<i', uexp, M['off_bones'] + 12 * i + 8)[0])
+    return out
+
+
+def expand_ancestors(bones, parents):
+    """Close a bone set over its ancestors - a skinned bone needs its chain."""
+    out = set(bones)
+    for b in list(bones):
+        p = parents[b] if 0 <= b < len(parents) else -1
+        while p >= 0 and p not in out:
+            out.add(p)
+            p = parents[p]
+    return out
+
+
+def bone_arrays(uexp, L, used, parents):
+    """RequiredBones / ActiveBoneIndices for a LOD, as uint16 blobs.
+
+    Vanilla prunes facial and twist bones at low LODs. Geometry that still
+    weights to them needs them listed, or a reader that builds the LOD
+    skeleton from these arrays cannot resolve the bone map. Vanilla's entries
+    are kept and the missing ones merged in.
+    """
+    need = expand_ancestors(used, parents)
+    van_req = set(struct.unpack_from(f'<{L["RequiredBonesCount"]}H', uexp, L['off_RequiredBones']))
+    van_act = set(struct.unpack_from(f'<{L["ActiveBonesCount"]}H', uexp, L['off_ActiveBones']))
+    req = sorted(van_req | need)
+    act = sorted(van_act | need)
+    return (struct.pack(f'<i{len(req)}H', len(req), *req),
+            struct.pack(f'<i{len(act)}H', len(act), *act),
+            len(req), len(act))
+
+
+def section_bytes(uexp, vanilla_section, new, patch_base_vertex=True, dup_verts='empty'):
     """Rebuild one section record, reusing vanilla's undecoded flag bytes.
 
     Everything in flags_a/b/c is copied verbatim except BaseVertexIndex, which
@@ -133,7 +162,16 @@ def section_bytes(uexp, vanilla_section, new, patch_base_vertex=True):
     o += struct.pack(f'<{len(new["bonemap"])}H', *new['bonemap'])
     o += struct.pack('<ii', new['verts'], new['maxinfl'])
     o += flags_b
-    o += struct.pack('<ii', 0, 0)      # DupVertData / DupVertIndexData: empty
+    if dup_verts == 'vanilla':
+        # Carry vanilla's duplicated-vertices buffers over verbatim. They map
+        # UV-seam duplicates for the recompute-tangents pass. The counts no
+        # longer match this build's vertices, but a working third-party mod
+        # does exactly this, and FModel may need them non-empty.
+        dv_start = S['off_DupVertDataCount']
+        dv_end = S['off_DupVertIndex'] + 8 * S['DupVertIndexCount']
+        o += uexp[dv_start:dv_end]
+    else:
+        o += struct.pack('<ii', 0, 0)      # DupVertData / DupVertIndexData: empty
     o += flags_c
     return bytes(o)
 
@@ -174,7 +212,13 @@ def postflight(ua, uexp, ubulk, regions, check_base_vertex=True):
     if struct.unpack_from('<i', ua, OFF_BULK_DATA_START)[0] != hdr + len(uexp) - 4:
         problems.append('BulkDataStartOffset is wrong')
     if sum(s for _, s in regions) != len(ubulk):
-        problems.append('DataResource sizes do not sum to the .ubulk length')
+        problems.append(f'DataResource sizes ({sum(s for _, s in regions)}) do not sum to '
+                        f'the .ubulk length ({len(ubulk)})')
+    run = 0
+    for k, (off, size) in enumerate(regions):
+        if off != run:
+            problems.append(f'DataResource entry {k} offset is {off}, expected {run}')
+        run += size
 
     start = mesh['SerialOffset'] - hdr
     try:
@@ -198,6 +242,15 @@ def postflight(ua, uexp, ubulk, regions, check_base_vertex=True):
         last = L['Sections'][-1]
         if last['BaseIndex'] + 3 * last['NumTriangles'] > bt * 3:
             problems.append(f'LOD{i} last section runs past the index buffer')
+        req = set(struct.unpack_from(f'<{L["RequiredBonesCount"]}H', uexp, L['off_RequiredBones']))
+        act = set(struct.unpack_from(f'<{L["ActiveBonesCount"]}H', uexp, L['off_ActiveBones']))
+        bm = set()
+        for S in L['Sections']:
+            bm |= set(S['BoneMap'])
+        if bm - req:
+            problems.append(f'LOD{i}: {len(bm - req)} bone-map entries missing from RequiredBones')
+        if bm - act:
+            problems.append(f'LOD{i}: {len(bm - act)} bone-map entries missing from ActiveBoneIndices')
         run_v = run_t = 0
         for j, S in enumerate(L['Sections']):
             if check_base_vertex and S['BaseVertexIndex'] != run_v:
@@ -239,6 +292,17 @@ def main():
                          "build's section boundaries, which is what the format specifies. "
                          "vanilla leaves the original values in place; the game ignores this "
                          "field either way, but FModel's preview may only work with vanilla.")
+    ap.add_argument('--buffers', choices=('exact', 'padded'), default='exact',
+                    help="exact (default) sizes each LOD buffer to your geometry and "
+                         "updates the data-resource entries and availability blocks to "
+                         "match. padded keeps vanilla's buffer sizes and fills the "
+                         "surplus with orphan vertices and unused index slots - smaller "
+                         "diff, but it stops FModel previewing and caps your vertex count.")
+    ap.add_argument('--dup-verts', choices=('empty', 'vanilla'), default='empty',
+                    help="empty (default) writes zero-length duplicated-vertices buffers, "
+                         "which shrinks the .uexp considerably and has shown no visible "
+                         "seams in game. vanilla copies the original buffers through; a "
+                         "working third-party mod does this and previews in FModel.")
     ap.add_argument('--scale', type=float, default=1.0,
                     help='multiply source positions (1.0 for centimetres, 100 if exported in metres)')
     a = ap.parse_args()
@@ -284,7 +348,11 @@ def main():
         if not psk.get('normals'):
             raise SystemExit(f'{path} has no VTXNORMS chunk; export it from FModel, '
                              'not from the Blender PSK addon')
-        L, st = bl4build.build_lod(psk, psk['normals'], budgets[i][0], budgets[i][1],
+        if a.buffers == 'exact':
+            bv, bt = len(psk['wedge_point']), len(psk['faces'])
+        else:
+            bv, bt = budgets[i]
+        L, st = bl4build.build_lod(psk, psk['normals'], bv, bt,
                                    maxinfl[i], trailers[i], scale=a.scale)
         built.append((L, st))
         secs = ' + '.join(f'{s["verts"]}/{s["tris"]}' for s in st['sections'])
@@ -293,20 +361,32 @@ def main():
 
     # --- .ubulk: streamed payloads back to back, in table order
     newub = bytearray()
+    newregions = []
     for i, L in enumerate(M['LODs']):
         if not L['inline']:
-            newub += bl4mesh.write_lod(built[i][0])
+            p = bl4mesh.write_lod(built[i][0])
+            newregions.append((len(newub), len(p)))
+            newub += p
 
     # --- .uexp: vanilla bytes everywhere except bounds and the section arrays
+    parents = bone_parents(vuexp, M)
+    new_secs_pre = [[dict(s2, maxinfl=min(maxinfl[i], 8)) for s2 in built[i][1]['sections']]
+                    for i in range(len(M['LODs']))]
+
     out = bytearray(vuexp[:extras]) + b'\x05\x00'
     origin, extent, radius = built[0][1]['bounds']
     out += struct.pack('<7d', *origin, *extent, radius)
     out += vuexp[M['off_materials'] - 4:M['LODs'][0]['off']]
+    streamed_seen = 0
     for i, L in enumerate(M['LODs']):
         st = built[i][1]
+        used = set()
+        for sec in new_secs_pre[i]:
+            used |= set(sec['bonemap'])
+        req_blob, act_blob, nreq, nact = bone_arrays(vuexp, L, used, parents)
         out += vuexp[L['off']:L['off_RequiredBonesCount']]
-        out += vuexp[L['off_RequiredBonesCount']:L['off_RequiredBones'] + 2 * L['RequiredBonesCount']]
-        new_secs = [dict(s, maxinfl=min(maxinfl[i], 8)) for s in st['sections']]
+        out += req_blob
+        new_secs = new_secs_pre[i]
         if len(new_secs) != len(L['Sections']):
             raise SystemExit(
                 f'LOD{i}: source mesh has {len(new_secs)} material section(s) but the '
@@ -314,24 +394,43 @@ def main():
                 'check the material slots on your mesh.')
         sb = bytearray(struct.pack('<i', len(new_secs)))
         for S, new in zip(L['Sections'], new_secs):
-            sb += section_bytes(vuexp, S, new, patch_base_vertex=(a.base_vertex_index == 'computed'))
+            sb += section_bytes(vuexp, S, new,
+                                patch_base_vertex=(a.base_vertex_index == 'computed'),
+                                dup_verts=a.dup_verts)
         out += sb
-        out += vuexp[L['off_ActiveBonesCount']:L['off_ActiveBones'] + 2 * L['ActiveBonesCount']]
+        out += act_blob
         if L['inline']:
             p = bl4mesh.write_lod(built[i][0])
             out += struct.pack('<i', len(p)) + p
         else:
-            out += vuexp[L['off_avail']:L['off_avail'] + bl4uexp.AVAIL_BLOCK]
+            blk = bytearray(vuexp[L['off_avail']:L['off_avail'] + bl4uexp.AVAIL_BLOCK])
+            if a.buffers == 'exact':
+                Lp = built[i][0]
+                off, size = newregions[streamed_seen]
+                struct.pack_into('<q', blk, bl4uexp.AV['streamedSize'], size)
+                struct.pack_into('<i', blk, bl4uexp.AV['indexCount'], Lp['idx_count'])
+                for k in ('numVerts1', 'numVerts2', 'numVerts3'):
+                    struct.pack_into('<i', blk, bl4uexp.AV[k], Lp['pos_count'])
+                struct.pack_into('<i', blk, bl4uexp.AV['influenceCount'], Lp['influence_count'])
+            out += bytes(blk)
+            streamed_seen += 1
     out += vuexp[M['off_nanite']:]
 
-    # --- .uasset: two size fields move with the .uexp
+    # --- .uasset: data-resource entries, then the two size fields
+    if a.buffers == 'exact':
+        dro = struct.unpack_from('<i', ua, OFF_DATA_RESOURCE)[0]
+        for k, (off, size) in enumerate(newregions):
+            p = dro + 8 + DR_ENTRY_V1 * k
+            struct.pack_into('<q', ua, p + 4, off)      # SerialOffset
+            struct.pack_into('<q', ua, p + 20, size)    # SerialSize
+            struct.pack_into('<q', ua, p + 28, size)    # RawSize
     delta = len(out) - len(vuexp)
     p = mesh_export['off_record'] + 28
     struct.pack_into('<q', ua, p, struct.unpack_from('<q', ua, p)[0] + delta)
     struct.pack_into('<i', ua, OFF_BULK_DATA_START,
                      struct.unpack_from('<i', ua, OFF_BULK_DATA_START)[0] + delta)
 
-    problems = postflight(ua, out, newub, regions,
+    problems = postflight(ua, out, newub, read_bulk_regions(ua),
                           check_base_vertex=(a.base_vertex_index == 'computed'))
     v_w = winding_agreement(bl4mesh.parse_lod(vubulk, *regions[0]))
     b_w = winding_agreement(bl4mesh.parse_lod(newub, *regions[0]))

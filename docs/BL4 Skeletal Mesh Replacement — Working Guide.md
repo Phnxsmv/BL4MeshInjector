@@ -1,4 +1,7 @@
 # BL4 Skeletal Mesh Replacement — Working Guide
+
+2026-09-19 · @Philip
+
 ## The core principle
 
 **Start from the vanilla cooked part and replace only the geometry inside it. Never cook your own asset and try to make it pass as a Gestalt part.**
@@ -105,7 +108,7 @@ Import the FModel PSK. It arrives in centimetres and will look huge against the 
 
 Constraints to respect while modelling:
 
-- **Stay under the vanilla vertex and triangle counts** for every LOD (see Budgets below). You can go under freely; you cannot go over.
+- **Vertex and triangle counts are unconstrained.** Buffers are sized to your geometry, so a LOD may be larger or smaller than vanilla's.
 - **Keep the material assignment clean.** Every vertex must belong to exactly one material — a vertex shared between faces of two materials forces a split the builder does not perform. The number of material slots must also match vanilla, since sections are derived from them.
 - **Keep the skeleton intact.** All 392 bones, same names, same order. The builder maps bone indices straight across and will not remap.
 
@@ -116,7 +119,7 @@ You need four. Two routes work:
 - **Unreal as a decimator only.** Import, let it auto-generate LODs, export all four as FBX. You are using Unreal for reduction and throwing away its cooked output. This is what was used successfully.
 - **Blender Decimate.** Collapse mode. Vanilla's ratios are roughly 0.65, 0.125 and 0.06 of LOD0 triangles.
 
-Vanilla also drops bones at lower LODs (`RequiredBones` goes 392 → 392 → 183 → 166) and reduces influences (7 → 4 → 2 → 1). The builder recomputes bone maps per section automatically, so this needs no manual handling.
+Vanilla also drops bones at lower LODs (`RequiredBones` goes 392 → 392 → 183 → 166) and reduces influences (7 → 4 → 2 → 1). The builder recomputes bone maps per section and extends `RequiredBones`/`ActiveBoneIndices` to cover whatever your geometry weights to, so this needs no manual handling.
 
 ### 4. Export
 
@@ -134,9 +137,11 @@ Run the builder, then repack the three output files into a mod pak with your usu
 
 ### The rule
 
-**Buffer lengths must not change.** The `.ubulk` has to stay exactly the size the data-resource table says, or that table needs rewriting too. So each LOD's vertex and index buffers are fixed-size containers, and your geometry has to fit inside them.
+**There is no vertex or triangle ceiling.** Each LOD's buffers are sized to your geometry, and the data-resource entries, offsets and availability blocks are rewritten to match. Your mesh can be larger or smaller than vanilla's.
 
-You may go **under** the vanilla counts freely. You may never go over.
+This was not obvious. The first working approach padded up to vanilla's counts, treating buffer lengths as fixed — and a third-party mod disproved it by growing LOD0 from 15,422 to 16,179 vertices, appending the larger payload to the end of the `.ubulk` and repointing its data-resource entry. Only nine bytes of its `.uasset` changed.
+
+`build_part.py --buffers exact` (the default) does this. The old fixed-size behaviour survives as `--buffers padded`, but see the pitfall below — **padding is what stops FModel previewing a build** — so there is rarely a reason to use it.
 
 ### Reference budgets (CorpoHacker upper body)
 
@@ -153,7 +158,7 @@ LOD2 and LOD3 are the tight ones. A decimated mesh usually fits, but check them 
 
 ### How padding works
 
-Two techniques, both taken from the working mods:
+Only relevant under `--buffers padded`. Two techniques, both taken from working mods:
 
 - **Orphan vertices.** Surplus vertex slots are filled with copies of the last real vertex, referenced by no triangle. They sit in the buffer as dead data. One working mod parks 2,522 of them.
 - **Degenerate triangles.** Surplus index slots are filled with repeated indices, so the triangle collapses to zero area and renders nothing. One working mod has 4,357.
@@ -275,7 +280,7 @@ python3 build_part.py \
 Two optional flags:
 
 - `--scale` multiplies source positions. Leave at 1.0 for centimetres; use 100 if your PSKs came out in metres.
-- `--base-vertex-index` is `computed` (default) or `vanilla`. See the pitfall below — the game ignores the field either way, but FModel's preview may only work with `vanilla`.
+- `--buffers` is `exact` (default) or `padded`. Exact sizes each LOD buffer to your geometry and rewrites the data-resource entries and availability blocks; padded keeps vanilla's sizes and fills the surplus, which caps your vertex count and stops FModel previewing. `--base-vertex-index` and `--dup-verts` exist for experimentation; their defaults are correct and neither affects the preview.
 
 The build reports per-LOD counts against budget, padding applied, payload sizes against vanilla, and the `.uasset` delta. If payload sizes come out identical to vanilla, the `.ubulk` length is unchanged and the data-resource table needs no edit — the simplest case.
 
@@ -337,17 +342,25 @@ Metres vs centimetres. See the scale section.
 
 Exported with a one-bone armature. Fix the root bone properly instead.
 
+### Bone maps reference bones the LOD has pruned
+
+Vanilla drops roughly 190 facial and twist bones at LOD2 and LOD3 (`RequiredBones` goes 392 → 392 → 183 → 166). Geometry that still weights to them yields bone maps containing indices absent from that LOD's `RequiredBones` and `ActiveBoneIndices`, which a reader building the LOD skeleton from those arrays cannot resolve.
+
+The builder rebuilds both arrays, merging in the bones your geometry uses plus their ancestor chains. Postflight enforces containment.
+
 ### Build fails with an index error in the bone map
 
 `IndexError` inside `bonemap()`. The source mesh has **more material slots than the builder produced sections for**, so some vertices never entered the ordering. Check the material count against vanilla — the lower body has three where the upper body has two. Current builds fail with an explicit message naming both counts instead.
 
 ### FModel will not preview, but the game renders fine
 
-Seen on both this project's builds and other people's working mods. Not fully explained.
+**Cause: padding.** A build whose buffers are padded up to vanilla's counts — orphan vertices and unused index slots — loads and renders correctly in-game but will not preview in FModel. Build with `--buffers exact` (the default) and the preview works.
 
-One contributing factor is `BaseVertexIndex`. Setting it correctly (`--base-vertex-index computed`, the default) stops FModel previewing; leaving vanilla's values (`--base-vertex-index vanilla`) restores the preview for a two-section part. The game ignores the field either way — a build declaring a section running 1,855 vertices past the end of its buffer still renders and customises correctly — so both are safe in-game.
+This was isolated by bisection: vanilla geometry re-encoded through the builder previewed fine, and so did the same with rebuilt bone arrays. Adding padding broke it, and vanilla geometry *artificially* padded broke it too — which ruled out the geometry itself.
 
-A three-section part did not preview under either setting, so FModel has at least one further issue beyond this field.
+Three other things were suspected and cleared along the way: `BaseVertexIndex` (`--base-vertex-index`), the duplicated-vertices buffers (`--dup-verts`), and bone-array coverage. Those flags remain for experimentation; the defaults are correct.
+
+Worth noting the game tolerated every one of these defects — padding, a stale `BaseVertexIndex`, and bone maps referencing pruned bones all rendered and customised correctly. FModel is the stricter reader, which makes a working preview a useful signal even though it is not the acceptance test.
 
 **Treat the game as the authority.** FModel's preview is a convenience, not a correctness criterion.
 
@@ -368,7 +381,7 @@ These errors mask each other. "It got worse" often means "it got further" — a 
 - `.uexp` parses with every byte accounted for
 - each LOD payload parses to exactly its declared size
 - section vertex and triangle sums ≤ buffer counts; the last section's index range lies inside the buffer
-- `BaseVertexIndex` and `BaseIndex` chain cumulatively through the sections
+- `BaseVertexIndex` and `BaseIndex` chain cumulatively; every bone-map entry appears in that LOD's `RequiredBones` and `ActiveBoneIndices`; data-resource offsets chain with no gaps and sum to the `.ubulk` length
 - triangle winding falls on the same side as vanilla's convention
 - geometry bounds match vanilla to \~2 decimals
 
@@ -382,11 +395,11 @@ The real test is in-game: the mesh renders in the menu and the world, deforms co
 
 Two deliberate shortcuts in the current builder, neither of which prevented a working result:
 
-- **Tangents are computed from UV derivatives** rather than taken from the source. Normals are exact; the tangent basis is reconstructed. Any artifact would show as odd specular behaviour along UV seams.
+- **Tangent vectors are computed from UV derivatives** rather than taken from the source. Normals are exact and handedness is computed correctly — vanilla marks \~13% of vertices as mirrored, and assuming `+1` everywhere was a real bug, now fixed. Only the tangent direction is approximated, where vanilla used MikkTSpace. Re-encoding vanilla's own LOD0 through the builder reproduces indices, positions and UVs byte-identically, normals on all but 351 of 18,234 vertices, and handedness on all but one.
 - **Duplicated-vertices buffers are written empty.** These feed recompute-tangents. Vanilla has real data there (11,406 entries for LOD0 section 0), and emptying them is what shrinks the `.uexp` by \~411 KB. Leaving them empty was checked in-game against the vanilla mesh and produced no visible seams, so it is the recommended default. Both vanilla sections have `bRecomputeTangent` set to false, so nothing reads these buffers for this part — populate them only if you enable that flag, work on a cloth section, or a seam actually shows.
 
 Also worth noting: the bounds radius comes out slightly tighter than vanilla (70.71 vs 72.38) because it is the exact bounding sphere of the new geometry. If the mesh culls early at extreme viewing angles, widen it.
 
 ### Verified working
 
-Both the CorpoHacker upper body (two sections) and lower body (three sections) build, load, render in the menu and the world, and support tinting and the customisation system. Topology can change freely between iterations provided every LOD stays under its budget.
+Both the CorpoHacker upper body (two sections) and lower body (three sections) build, load, render in the menu and the world, animate correctly, support tinting and the customisation system, **and preview in FModel**. Topology can change freely between iterations, in either direction — there is no budget to stay under.

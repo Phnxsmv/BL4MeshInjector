@@ -19,8 +19,14 @@ def _pack_i8(v, w):
     return bytes(struct.pack('<4b', q(v[0]), q(v[1]), q(v[2]), w))
 
 def compute_tangents(pos, uv, tris, normals):
-    """Per-vertex tangent from UV derivatives, Gram-Schmidt against the normal."""
+    """Per-vertex tangent and handedness from UV derivatives.
+
+    Returns (tangent, sign) pairs. The sign goes in the normal's W byte and is
+    negative wherever the UV shell is mirrored; vanilla marks roughly 13% of
+    vertices that way, so assuming +1 everywhere breaks normal mapping there.
+    """
     acc=[[0.0,0.0,0.0] for _ in pos]
+    bacc=[[0.0,0.0,0.0] for _ in pos]
     for a,b,c in tris:
         if a==b or b==c or a==c: continue
         p0,p1,p2=pos[a],pos[b],pos[c]
@@ -34,8 +40,12 @@ def compute_tangents(pos, uv, tris, normals):
         t=((e1[0]*d2[1]-e2[0]*d1[1])*r,
            (e1[1]*d2[1]-e2[1]*d1[1])*r,
            (e1[2]*d2[1]-e2[2]*d1[1])*r)
+        bt=((e2[0]*d1[0]-e1[0]*d2[0])*r,
+            (e2[1]*d1[0]-e1[1]*d2[0])*r,
+            (e2[2]*d1[0]-e1[2]*d2[0])*r)
         for i in (a,b,c):
             acc[i][0]+=t[0]; acc[i][1]+=t[1]; acc[i][2]+=t[2]
+            bacc[i][0]+=bt[0]; bacc[i][1]+=bt[1]; bacc[i][2]+=bt[2]
     out=[]
     for i,n in enumerate(normals):
         t=acc[i]
@@ -45,7 +55,11 @@ def compute_tangents(pos, uv, tris, normals):
             t=(1.0,0.0,0.0) if abs(n[0])<0.9 else (0.0,1.0,0.0)
             d=t[0]*n[0]+t[1]*n[1]+t[2]*n[2]
             t=(t[0]-n[0]*d, t[1]-n[1]*d, t[2]-n[2]*d)
-        out.append(_norm(t))
+        t=_norm(t)
+        # handedness: does the accumulated bitangent agree with N x T?
+        cx=(n[1]*t[2]-n[2]*t[1], n[2]*t[0]-n[0]*t[2], n[0]*t[1]-n[1]*t[0])
+        dot=cx[0]*bacc[i][0]+cx[1]*bacc[i][1]+cx[2]*bacc[i][2]
+        out.append((t, 1 if dot>=0 else -1))
     return out
 
 def build_lod(psk, normals, budget_verts, budget_tris, max_infl, trailer, scale=1.0):
@@ -85,7 +99,7 @@ def build_lod(psk, normals, budget_verts, budget_tris, max_infl, trailer, scale=
         sec_tris.append([(remap[f[0]],remap[f[2]],remap[f[1]])
                          for f,fm in zip(psk['faces'],psk['face_mat']) if fm==m])
     tris=[t for group in sec_tris for t in group]
-    tan=compute_tangents(pos,uv,tris,nrm)
+    tanpairs=compute_tangents(pos,uv,tris,nrm)
 
     # --- weights per vertex
     pw=defaultdict(list)
@@ -111,7 +125,8 @@ def build_lod(psk, normals, budget_verts, budget_tris, max_infl, trailer, scale=
     P=bytearray(); T=bytearray(); UV=bytearray(); W=bytearray()
     for i in range(nverts):
         P+=struct.pack('<3f',*pos[i])
-        T+=_pack_i8(tan[i],127)+_pack_i8(nrm[i],127)
+        tv,sgn=tanpairs[i]
+        T+=_pack_i8(tv,127)+_pack_i8(nrm[i],127 if sgn>0 else -127)
         UV+=struct.pack('<2e',*uv[i])
         sec=next(s for s in reversed(sections) if i>=s['vbase'])
         ws=vw[i]; tot=sum(w for w,_ in ws) or 1.0

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Validate a built BL4 part against the vanilla original.
 
-    python3 verify_part.py --vanilla /path/SKPart_Name --built /path/to/output/SKPart_Name
+    python3 verify_part.py --vanilla /path/SKPart_Name --built /path/to/output
 
 Reads every structural field from the files themselves, so it works on any
 part. Prints one line per check; exits non-zero if anything fails.
 """
 import argparse, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from modules import bl4mesh, bl4uexp
+import bl4mesh, bl4uexp
 from build_part import (read_summary, read_bulk_regions, find_extras_start,
-                        OFF_BULK_DATA_START, OFF_DATA_RESOURCE)
+                        bulk_data_start_offset, data_resource_offset)
 
 def load(base):
     return (bytearray(open(base + '.uasset', 'rb').read()),
@@ -41,8 +41,8 @@ def main():
     for e in summ['exports']:
         chk(f'export {e["index"]} SerialOffset', e['SerialOffset'], running)
         running += e['SerialSize']
-    chk('BulkDataStartOffset', struct.unpack_from('<i', ua, OFF_BULK_DATA_START)[0], hdr + len(uexp) - 4)
-    dro = struct.unpack_from('<i', ua, OFF_DATA_RESOURCE)[0]
+    chk('BulkDataStartOffset', struct.unpack_from('<i', ua, bulk_data_start_offset(ua))[0], hdr + len(uexp) - 4)
+    dro = struct.unpack_from('<i', ua, data_resource_offset(ua))[0]
     chk('ObjectDataResource version', struct.unpack_from('<i', ua, dro)[0], 1)
 
     regions = read_bulk_regions(ua)

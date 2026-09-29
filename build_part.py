@@ -28,16 +28,34 @@ from modules import bl4psk, bl4mesh, bl4uexp, bl4build
 
 # Offsets into the .uasset package summary. These are stable for BL4 packages.
 OFF_TOTAL_HEADER_SIZE = 0x1c
-OFF_SUMMARY           = 0x88    # (NameCount, NameOffset), then the rest of the summary
-OFF_BULK_DATA_START   = 0x110
-OFF_DATA_RESOURCE     = 0x134
+OFF_FOLDER_NAME       = 0x20    # FString; its length decides where the summary starts
+
+# The summary follows the package's FolderName, so its absolute position depends
+# on how long that path is: 0x88 for a part under PlayerCharacters/CorpoHacker,
+# 0xB1 for one under PlayerCharacters/Customizations/... . These are relative to it.
+REL_BULK_DATA_START   = 0x88
+REL_DATA_RESOURCE     = 0xAC
+
+
+def summary_offset(ua):
+    n = struct.unpack_from('<i', ua, OFF_FOLDER_NAME)[0]
+    size = n if n >= 0 else -n * 2              # negative length = UTF-16
+    return OFF_FOLDER_NAME + 4 + size + 4       # length, string, PackageFlags
+
+
+def bulk_data_start_offset(ua):
+    return summary_offset(ua) + REL_BULK_DATA_START
+
+
+def data_resource_offset(ua):
+    return summary_offset(ua) + REL_DATA_RESOURCE
 DR_ENTRY_V1           = 44      # bytes per ObjectDataResource entry at version 1
 
 
 def read_summary(ua):
     """Pull the handful of package-summary fields the build needs."""
     hdr = struct.unpack_from('<i', ua, OFF_TOTAL_HEADER_SIZE)[0]
-    ints = struct.unpack_from('<' + 'i' * 12, ua, OFF_SUMMARY)
+    ints = struct.unpack_from('<' + 'i' * 12, ua, summary_offset(ua))
     export_count, export_off, depends_off = ints[6], ints[7], ints[10]
     stride = (depends_off - export_off) // export_count
     exports = []
@@ -54,7 +72,7 @@ def read_bulk_regions(ua):
     Source of truth is the ObjectDataResource table. Entries with SerialSize 0
     are the inline LOD, which lives in the .uexp instead, so they are skipped.
     """
-    dro = struct.unpack_from('<i', ua, OFF_DATA_RESOURCE)[0]
+    dro = struct.unpack_from('<i', ua, data_resource_offset(ua))[0]
     version, count = struct.unpack_from('<ii', ua, dro)
     if version != 1:
         raise SystemExit(f'ObjectDataResource version {version}; BL4 expects 1. '
@@ -209,7 +227,7 @@ def postflight(ua, uexp, ubulk, regions, check_base_vertex=True):
         if e['SerialOffset'] != running:
             problems.append(f'export {e["index"]} SerialOffset is wrong')
         running += e['SerialSize']
-    if struct.unpack_from('<i', ua, OFF_BULK_DATA_START)[0] != hdr + len(uexp) - 4:
+    if struct.unpack_from('<i', ua, bulk_data_start_offset(ua))[0] != hdr + len(uexp) - 4:
         problems.append('BulkDataStartOffset is wrong')
     if sum(s for _, s in regions) != len(ubulk):
         problems.append(f'DataResource sizes ({sum(s for _, s in regions)}) do not sum to '
@@ -418,7 +436,7 @@ def main():
 
     # --- .uasset: data-resource entries, then the two size fields
     if a.buffers == 'exact':
-        dro = struct.unpack_from('<i', ua, OFF_DATA_RESOURCE)[0]
+        dro = struct.unpack_from('<i', ua, data_resource_offset(ua))[0]
         for k, (off, size) in enumerate(newregions):
             p = dro + 8 + DR_ENTRY_V1 * k
             struct.pack_into('<q', ua, p + 4, off)      # SerialOffset
@@ -427,8 +445,8 @@ def main():
     delta = len(out) - len(vuexp)
     p = mesh_export['off_record'] + 28
     struct.pack_into('<q', ua, p, struct.unpack_from('<q', ua, p)[0] + delta)
-    struct.pack_into('<i', ua, OFF_BULK_DATA_START,
-                     struct.unpack_from('<i', ua, OFF_BULK_DATA_START)[0] + delta)
+    bds = bulk_data_start_offset(ua)
+    struct.pack_into('<i', ua, bds, struct.unpack_from('<i', ua, bds)[0] + delta)
 
     problems = postflight(ua, out, newub, read_bulk_regions(ua),
                           check_base_vertex=(a.base_vertex_index == 'computed'))

@@ -24,7 +24,7 @@ is read from the vanilla files, so this works on any part.
 import argparse, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # find the bl4* modules next to this script
-import bl4psk, bl4mesh, bl4uexp, bl4build
+from modules import bl4psk, bl4mesh, bl4uexp, bl4build
 
 # Offsets into the .uasset package summary. These are stable for BL4 packages.
 OFF_TOTAL_HEADER_SIZE = 0x1c
